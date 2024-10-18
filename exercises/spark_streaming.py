@@ -1,9 +1,12 @@
 import json
 
+import numpy as np
 from pyspark.ml import Pipeline
+from pyspark.ml.clustering import KMeans
 from pyspark.ml.feature import OneHotEncoder, StringIndexer, VectorAssembler
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, date_format, window
+from pyspark.sql.functions import col, date_format, udf, window
+from pyspark.sql.types import DoubleType
 
 # Load the configuration file
 with open('config.json') as config_file:
@@ -62,3 +65,38 @@ fittedPipeline = transformationPipeline.fit(trainDataFrame)
 transformedTraining = fittedPipeline.transform(trainDataFrame)
 
 transformedTraining.cache()
+
+kmeans = KMeans()\
+    .setK(20)\
+    .setSeed(1)
+
+kmModel = kmeans.fit(transformedTraining)
+print(kmModel.summary.trainingCost)
+transformedTraining.unpersist()
+transformedTest = fittedPipeline.transform(testDataFrame)
+
+testPredictions = kmModel.transform(transformedTest)
+
+# Compute test cost manually (as training cost is available only for the training set)
+# Use the cluster centers from the trained model
+centers = kmModel.clusterCenters()
+
+
+# UDF to compute squared distance between a point and its assigned cluster center
+def squared_distance(point, center):
+    return float(np.sum((np.array(point) - np.array(center)) ** 2))
+
+
+# Register UDF
+squared_distance_udf = udf(lambda point, cluster_idx: squared_distance(point, centers[cluster_idx]), DoubleType())
+
+# Add squared distance column to the test predictions
+testPredictionsWithCost = testPredictions.withColumn(
+    "squaredDistance",
+    squared_distance_udf(col("features"), col("prediction"))
+)
+
+# Sum the squared distances to get the test set cost (WSSSE for test data)
+testCost = testPredictionsWithCost.agg({"squaredDistance": "sum"}).collect()[0][0]
+
+print(f"Test Set Sum of Squared Errors (WSSSE) = {testCost}")
